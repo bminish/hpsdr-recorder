@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Report a Linrad .raw recording's tuning error against the MW 9 kHz carrier grid.
+"""Report a Linrad .raw recording's tuning error against the broadcast carrier grid.
 
-Usage: check_grid.py <file.raw> [grid_khz]
+Usage: check_grid.py <file.raw> [grid_khz] [skip_seconds]
+
+  grid_khz       channel spacing, 9 (Europe, default) or 10 (North America)
+  skip_seconds   how far into the file to analyse (default 30, clamped to fit)
+
+Strong carriers should land within a few Hz of the grid. A constant offset
+across every carrier means spectral inversion, not mistuning - see README.md.
+The peak at exactly 0 Hz offset is the DC/LO spur, not a station.
 """
 import sys, struct
 import numpy as np
+
+if len(sys.argv) < 2:
+    print(__doc__.strip(), file=sys.stderr)
+    sys.exit(1)
 
 path = sys.argv[1]
 grid = int(sys.argv[2]) * 1000 if len(sys.argv) > 2 else 9000
