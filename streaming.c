@@ -40,10 +40,14 @@ static inline int16_t pack_q(int32_t v24, int *clipped) {
     return pack_sample(-v24, clipped);
 }
 
-// Peak of the raw 24-bit samples, so the report is independent of the shift.
+// Peak and amplitude distribution of the raw 24-bit samples, so the report is
+// independent of the shift. The distribution is what tells impulse noise apart
+// from steady signal: a single peak cannot.
 static inline void track_peak(int32_t v24, int32_t *peak) {
     int32_t a = v24 < 0 ? -v24 : v24;
+    if (a > 8388607) a = 8388607;
     if (a > *peak) *peak = a;
+    stats_amp_hist[a >> STATS_HIST_SHIFT]++;
 }
 
 static long long overrun_events = 0;

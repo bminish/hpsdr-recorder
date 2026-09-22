@@ -6,6 +6,7 @@
 static long long total_samples = 0;
 static long long total_clipped = 0;
 static int32_t peak_sample = 0;
+long long stats_amp_hist[STATS_HIST_BINS];
 static long long total_lost = 0;
 static long long total_writes = 0;
 static long long partial_writes = 0;
@@ -44,18 +45,48 @@ int print_stats(void) {
     if (peak_sample > 0) {
         // 24-bit full scale, independent of the shift that was applied
         double dbfs = 20.0 * log10((double)peak_sample / 8388607.0);
-
-        // Smallest shift that would still have fitted, keeping 6 dB spare
-        int suggested = 0;
-        while (suggested < 8 && ((peak_sample * 2) >> suggested) > 32767) suggested++;
-
         printf("Peak level: %.1f dBFS (24-bit full scale)\n", dbfs);
-        printf("Sample shift used: %d", sample_shift);
+
+        long long total = 0;
+        for (int i = 0; i < STATS_HIST_BINS; i++) total += stats_amp_hist[i];
+        if (total > 0) {
+            // 99.9% level: the band's routine amplitude, with impulses excluded
+            long long cum = 0, want = (long long)(0.999 * (double)total);
+            int bin = 0;
+            for (bin = 0; bin < STATS_HIST_BINS; bin++) {
+                cum += stats_amp_hist[bin];
+                if (cum >= want) break;
+            }
+            double routine = (double)((bin + 1) << STATS_HIST_SHIFT);
+            if (routine < 1.0) routine = 1.0;
+            printf("99.9%% of samples below %.1f dBFS -- impulse peaks run %.1f dB above that\n",
+                   20.0 * log10(routine / 8388607.0),
+                   20.0 * log10((double)peak_sample / routine));
+        }
+
+        // Headroom to clipping at the shift actually used, and the most
+        // aggressive shift that still keeps a margin for impulse noise.
+        // The margin is deliberately generous: a short run's peak says little
+        // about the static crash that arrives at 3am, and a clipped impulse is
+        // not merely distorted - it can no longer be removed by a noise
+        // blanker downstream, which needs the impulse's true shape.
+        const double margin_db = 20.0;
+        double headroom = 20.0 * log10(32767.0 / ((double)peak_sample / (double)(1 << sample_shift)));
+        printf("Sample shift used: %d -- %.1f dB of headroom above this run's peak\n",
+               sample_shift, headroom);
+
+        int suggested = sample_shift;
+        while (suggested > 0) {
+            double h = 20.0 * log10(32767.0 / ((double)peak_sample / (double)(1 << (suggested - 1))));
+            if (h < margin_db) break;
+            suggested--;
+        }
         if (suggested < sample_shift) {
-            printf("  -- %d would have fitted with 6 dB spare (+%d dB of weak-signal range)\n",
-                   suggested, 6 * (sample_shift - suggested));
-        } else {
-            printf("\n");
+            printf("   shift %d would keep %.0f dB of margin (+%d dB weak-signal range);\n"
+                   "   going lower risks clipping impulse noise, which cannot be undone\n",
+                   suggested,
+                   20.0 * log10(32767.0 / ((double)peak_sample / (double)(1 << suggested))),
+                   6 * (sample_shift - suggested));
         }
     }
 

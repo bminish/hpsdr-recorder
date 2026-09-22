@@ -131,16 +131,32 @@ typical MW levels only ~10 of the 16 bits are exercised — the DDC's decimation
 processing gain, where weak DX lives, is in the bits being dropped. Each bit
 less is 6 dB more weak-signal range, at the cost of headroom.
 
-Every run reports what it saw, so choose from measurement, not guesswork:
+**Headroom is not spare capacity — it is what absorbs impulse noise.** Static
+crashes, ignition and switching transients run far above the routine signal
+level. Measured on this setup: 99.9% of samples sit 15 dB below the peak at
+dusk, and 35 dB below it on a daytime band full of local electrical noise.
+
+Clipping an impulse is worse than it first appears. `pack_sample()` saturates
+rather than wrapping, which avoids the catastrophic case — a wrapped impulse
+becomes a full-scale polarity flip that sprays energy across the whole
+passband. But a saturated impulse has still lost its shape, and **a noise
+blanker downstream cannot remove an impulse whose shape was destroyed at
+record time.** That loss is permanent in the archive. Do not trade impulse
+headroom for a few dB of weak-signal range.
+
+Every run reports the distribution, not just a peak, so the choice is
+measurable:
 
 ```
-Peak level: -25.6 dBFS (24-bit full scale)
-Sample shift used: 8  -- 5 would have fitted with 6 dB spare (+18 dB of weak-signal range)
+Peak level: -24.4 dBFS (24-bit full scale)
+99.9% of samples below -60.2 dBFS -- impulse peaks run 35.0 dB above that
+Sample shift used: 8 -- 25.2 dB of headroom above this run's peak
 Clipped values: none
 ```
 
-Night-time levels rise substantially, so a shift chosen by day may clip after
-dark — clipping is counted and reported, so check the exit summary.
+A lower shift is only suggested when it would still leave 20 dB of margin, and
+even then, remember that a short run's peak says nothing about the crash that
+arrives at 3am. Clipping is counted, so check the exit summary after a night.
 
 Attenuation is rarely needed: measured peaks sit ~25–30 dB below full scale on
 a typical MW antenna, and attenuation only costs SNR. It applies to **both**
