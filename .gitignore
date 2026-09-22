@@ -1,0 +1,16 @@
+# CMake generates these in-tree
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+/hpsdr-recorder
+
+# Recordings and analysis artifacts - these are data, not source
+*.raw
+*.wvd
+*.wvi
+*.png
+
+# Crash dumps
+vgcore.*
+core.*
