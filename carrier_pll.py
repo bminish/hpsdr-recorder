@@ -28,6 +28,7 @@ LOOP_BW_HZ = 0.5                 # PLL noise bandwidth
 DAMPING = 0.707
 SETTLE_S = 20.0                  # let the loop acquire before measuring
 SEGMENT_S = 300.0                # report stability over 5-minute segments
+ZERO_RUN_MIN = 64                # consecutive zeros that indicate real zero-fill
 
 
 def read_header(path):
@@ -158,8 +159,16 @@ def measure(path, hdr, target_hz, max_seconds=None):
             ph = -2.0 * np.pi * (num / fs + frac / fs)
             sig = sig * np.exp(1j * ph)
 
+            # Zero-fill from a lost packet arrives as a RUN of at least one
+            # packet's worth of samples. Isolated (0,0) samples are just the
+            # signal crossing zero, and at low levels there are millions of
+            # them - counting those was badly misleading.
             zeros = (x[:, 0] == 0) & (x[:, 1] == 0)
-            zero_run += int(zeros.sum())
+            if zeros.any():
+                edges = np.flatnonzero(np.diff(np.concatenate(([0], zeros.view(np.int8), [0]))))
+                starts, ends = edges[0::2], edges[1::2]
+                runs = ends - starts
+                zero_run += int(runs[runs >= ZERO_RUN_MIN].sum())
 
             d = decimate(stages, sig)
             # A decimated sample is trusted only if it is not tiny (zero-fill
@@ -222,7 +231,8 @@ def main():
         print(f"     over              : {r['seconds']:.1f} s")
         print(f"     PLL locked        : {r['lock_pct']:.1f} %  "
               f"(coasted {r['coast_pct']:.2f} % on zero-fill/fades)")
-        print(f"     zero-filled input : {r['zero_samples']} samples")
+        print(f"     zero-filled input : {r['zero_samples']} samples "
+              f"(runs of >= {ZERO_RUN_MIN})")
         segs = r['segments']
         if len(segs) >= 2:
             sd = float(np.std(segs))
