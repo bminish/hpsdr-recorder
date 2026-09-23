@@ -233,6 +233,41 @@ fix at source is to lock the radio to an external 10 MHz reference.
 Zero-filled samples from lost packets are gated out so the loop coasts through
 them rather than being dragged toward zero.
 
+## Comparing the two diversity arms
+
+`arm_compare.py` measures how well the two receive arms are matched, using two
+independent methods from one averaged cross-spectrum:
+
+```sh
+./arm_compare.py recording.raw
+./arm_compare.py recording.raw --quiet 1400-1460 --min-snr 12
+```
+
+- **Noise floor**, as a low percentile per band so carriers do not count. It
+  reflects what each arm delivers, but is contaminated by local man-made noise.
+- **Broadcast carriers** on the 9 kHz grid, immune to a raised noise floor, but
+  individual carriers fade independently on separated antennas, so only the
+  median over many of them means anything.
+
+The useful part is the gap between the two. If an arm's own antenna noise
+dominates its receiver noise — which is what you want — then its noise floor
+sits above the other arm by the *same* amount as its gain. A gap says which
+effect is in play:
+
+| gap | meaning |
+|---|---|
+| ≈ 0 | both arms antenna-noise-limited (ideal) |
+| positive | that arm has excess noise: man-made, local |
+| negative | the weaker arm is **receiver-limited** and losing that many dB |
+
+The cross-spectrum also gives per-carrier coherence and phase. A consistent
+phase slope across frequency would be a fixed delay between arms; a large
+residual instead means the arms see independently fading paths, which is the
+whole point of spatial diversity.
+
+ch1 is ADC0, fed from whichever jack the `antenna` setting selected; ch2 is
+ADC1, which has its own feed. Check the recorder log and relabel accordingly.
+
 ## Exit diagnostics
 
 ```
