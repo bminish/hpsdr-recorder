@@ -111,11 +111,18 @@ int hpsdr_connect(const char *ip_addr) {
     // Maximize receive buffer for deep buffering. The kernel silently caps this
     // at net.core.rmem_max, so read back what we actually got: a request for
     // 16 MB commonly lands at 5 MB, which is only ~280 ms of this stream.
-    int rcvbuf = 1024 * 1024 * 16; // 16MB
+    int rcvbuf = 1024 * 1024 * socket_buffer_mb;
     setsockopt(data_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     socklen_t optlen = sizeof(rcvbuf_granted);
     if (getsockopt(data_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_granted, &optlen) == 0) {
         rcvbuf_granted /= 2; // kernel reports double the usable size
+    }
+    if (rcvbuf_granted < rcvbuf) {
+        fprintf(stderr,
+                "warning: asked for %d MB of receive buffer, kernel granted %.1f MB.\n"
+                "         Raise the ceiling to keep the full request:\n"
+                "           sudo sysctl -w net.core.rmem_max=%d\n",
+                socket_buffer_mb, rcvbuf_granted / 1048576.0, rcvbuf);
     }
 
     // Ask the kernel to tell us how many datagrams it dropped for this socket,

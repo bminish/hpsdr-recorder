@@ -15,6 +15,7 @@ int rx_antenna = RX_ANT_ANT1; // which jack feeds the receivers
 int sample_shift = 8;         // 24-bit sample >> this many bits to make 16-bit
 int alex_new_pa_board = 1;    // Rev.24 PA board (matches this radio's piHPSDR setting)
 int streaming_time = 0;       // seconds; 0 = record until Ctrl+C
+int socket_buffer_mb = 64;    // UDP receive buffer; ~3.6 s of slack at 1536 kHz
 int freq_correction = 0; // Hz added to the DDC tuning word; calibration only, see hpsdr-protocol2.c
 int output_type = OUTPUT_TYPE_LINRAD;
 char *output_file = "hpsdr_recording.raw";
@@ -33,6 +34,7 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -o <file>       Output file (default hpsdr_recording.raw)\n");
     fprintf(stderr, "  -k <hz>         DDC tuning correction in Hz (default 0, calibration only)\n");
     fprintf(stderr, "  -x <secs>       Streaming time in seconds (default 0 = until Ctrl+C)\n");
+    fprintf(stderr, "  -B <mb>         UDP receive buffer in MB (default 64; needs rmem_max)\n");
     fprintf(stderr, "  -a <db>         ADC attenuation 0-31 dB (default 0)\n");
     fprintf(stderr, "  -A <ant>        RX antenna: ant1|ant2|ant3|ext1|ext2|xvtr (default ant1)\n");
     fprintf(stderr, "  -s <bits>       Sample shift 0-8; 24-bit -> 16-bit (default 8).\n");
@@ -129,6 +131,9 @@ int read_config_file(const char *filepath) {
         } else if (strcasecmp(key, "streaming time") == 0 || strcasecmp(key, "streaming_time") == 0
                    || strcasecmp(key, "duration") == 0) {
             streaming_time = clamp_int("streaming time", atoi(val), 0, 365 * 24 * 3600);
+        } else if (strcasecmp(key, "socket buffer") == 0 || strcasecmp(key, "socket_buffer") == 0
+                   || strcasecmp(key, "rcvbuf_mb") == 0) {
+            socket_buffer_mb = clamp_int("socket buffer", atoi(val), 1, 1024);
         } else if (strcasecmp(key, "attenuation") == 0 || strcasecmp(key, "atten") == 0) {
             attenuation = clamp_int("attenuation", atoi(val), 0, 31);
         } else if (strcasecmp(key, "antenna") == 0 || strcasecmp(key, "rx_antenna") == 0) {
@@ -165,7 +170,7 @@ int get_config_from_cli(int argc, char *argv[]) {
     }
     
     optind = 1; // Reset getopt
-    while ((opt = getopt(argc, argv, "c:i:r:f:F:do:k:a:A:s:x:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:i:r:f:F:do:k:a:A:s:x:B:")) != -1) {
         switch (opt) {
             case 'c':
                 // Already read
@@ -193,6 +198,9 @@ int get_config_from_cli(int argc, char *argv[]) {
                 break;
             case 'x':
                 streaming_time = clamp_int("streaming time", atoi(optarg), 0, 365 * 24 * 3600);
+                break;
+            case 'B':
+                socket_buffer_mb = clamp_int("socket buffer", atoi(optarg), 1, 1024);
                 break;
             case 'a':
                 attenuation = clamp_int("attenuation", atoi(optarg), 0, 31);

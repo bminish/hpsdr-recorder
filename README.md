@@ -40,6 +40,7 @@ With no `-i`, the radio is auto-discovered by broadcast.
 | `-A <ant>` | RX antenna: `ant1 ant2 ant3 ext1 ext2 xvtr` | `ant1` |
 | `-s <bits>` | Sample shift, 0–8 (see below) | 8 |
 | `-k <hz>` | DDC tuning correction — calibration only | 0 |
+| `-B <mb>` | UDP receive buffer in MB | 64 |
 
 ## Config file
 
@@ -61,6 +62,7 @@ silently ignored. Both spellings of each key are accepted.
 | `output type`, `output_type` | Only `Linrad` is supported |
 | `freq_correction` | Calibration offset in Hz; normally 0 |
 | `new_pa_board`, `alex_new_pa_board` | 1 for Rev.24 PA board |
+| `socket buffer`, `socket_buffer`, `rcvbuf_mb` | UDP receive buffer in MB |
 
 The output filename expands `{TIMESTAMP}` (UTC, `20260922T143000Z`) and
 `{FREQKHZ}` (e.g. `950kHz`).
@@ -217,14 +219,22 @@ arrived and we were too slow to collect them — a local, fixable problem.
 Sequence gaps with *zero* socket drops mean they never arrived at all, which
 is the network.
 
-**The receive buffer is worth checking.** The recorder asks for 16 MB, but the
-kernel silently caps it at `net.core.rmem_max`, commonly 5 MB — only ~280 ms of
-this stream. On a remote or busy link, raise it:
+**The receive buffer needs a matching kernel ceiling.** The recorder asks for
+64 MB (~3.6 s of this stream), but the kernel silently caps any request at
+`net.core.rmem_max`, which commonly ships at 5 MB — only ~280 ms. The run warns
+when it is capped and prints the command to fix it:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=67108864
-sudo sysctl -w net.core.netdev_max_backlog=5000
 ```
+
+That is a ceiling on what a program may *request*, not an allocation: programs
+that do not ask are unaffected, and TCP is governed separately by
+`net.ipv4.tcp_rmem`. Make it permanent with a file in `/etc/sysctl.d/`.
+
+`net.core.netdev_max_backlog` is a different queue and is usually not the
+limit — check `/proc/net/softnet_stat` column 2 for backlog drops before
+raising it, since a deeper queue trades dropping sooner for queueing longer.
 
 Datagrams are collected with `recvmmsg()` in batches of up to 64. At 1536 kHz
 diversity the radio sends ~12900 packets/s, and one syscall per packet is a

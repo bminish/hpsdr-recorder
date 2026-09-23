@@ -26,6 +26,7 @@ extern int rx_antenna;
 extern int sample_shift;
 extern int alex_new_pa_board;
 extern int streaming_time;
+extern int socket_buffer_mb;
 
 const char *rx_antenna_name(int ant);
 extern int output_type;
