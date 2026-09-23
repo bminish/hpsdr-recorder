@@ -128,23 +128,43 @@ The peak at exactly 0 Hz offset is the DC/LO spur, not a station.
 ## Choosing sample shift and attenuation
 
 The radio sends 24-bit samples; the file holds 16-bit, so `sample_shift` bits
-are discarded. Shift 8 keeps the top 16 bits and **cannot clip**, but with
-typical MW levels only ~10 of the 16 bits are exercised — the DDC's decimation
-processing gain, where weak DX lives, is in the bits being dropped. Each bit
-less is 6 dB more weak-signal range, at the cost of headroom.
+are discarded. Shift 8 keeps the top 16 bits and **cannot clip**.
 
-**Headroom is not spare capacity — it is what absorbs impulse noise.** Static
-crashes, ignition and switching transients run far above the routine signal
-level. Measured on this setup: 99.9% of samples sit 15 dB below the peak at
-dusk, and 35 dB below it on a daytime band full of local electrical noise.
+The question this raises is *not* "how many bits are we exercising". What
+decides it is whether the received band noise is still well above the
+quantisation floor: if it is, the discarded low bits held only noise, and
+nothing was lost. Both the band noise and the quantisation noise scale
+identically with any later narrowband processing gain, so the wideband ratio
+settles it and applies equally to a 1 Hz carrier analysis. `noise_check.py`
+measures exactly this.
+
+Measured here on a quiet daytime band — close to the worst case — at shift 8:
+
+| | wideband RMS | quantisation below noise | noise it adds |
+|---|---|---|---|
+| ch1 | 10.6 LSB | 31.3 dB | **0.0032 dB** |
+| ch2 | 3.5 LSB | 21.8 dB | **0.0288 dB** |
+
+So shift 8 costs three thousandths of a dB. **Reducing it buys nothing
+measurable**, and the cost is real: impulse headroom. Keep the wideband RMS
+above a few LSB and quantisation is a non-issue; below ~1 LSB it starts
+destroying weak-signal detail and a smaller shift would genuinely help.
+
+**Beware of choosing a shift from a quiet daytime band.** That same hour peaked
+at −36 dBFS, while a night-time recording on this setup peaked at −8.5 dBFS —
+28 dB higher. A shift that looks comfortable by day will clip badly after dark.
+
+**Headroom is what absorbs impulse noise.** Static crashes, ignition and
+switching transients run far above the routine level: measured here, 99.9% of
+samples sit 15 dB below the peak at dusk and 35 dB below it on a daytime band
+with local electrical noise.
 
 Clipping an impulse is worse than it first appears. `pack_sample()` saturates
 rather than wrapping, which avoids the catastrophic case — a wrapped impulse
 becomes a full-scale polarity flip that sprays energy across the whole
 passband. But a saturated impulse has still lost its shape, and **a noise
 blanker downstream cannot remove an impulse whose shape was destroyed at
-record time.** That loss is permanent in the archive. Do not trade impulse
-headroom for a few dB of weak-signal range.
+record time.** That loss is permanent in the archive.
 
 Every run reports the distribution, not just a peak, so the choice is
 measurable:

@@ -266,14 +266,38 @@ def main():
         print()
 
     if len(results) >= 2:
-        print("  --- common-mode check ---")
+        print("  --- receiver clock estimate ---")
+        # A carrier is usable for calibration only if the loop actually held it
+        # and the segments agree. The median is then robust against the ones
+        # that are simply off frequency - which is most of the point, since it
+        # identifies them too.
+        # Stability is only a usable filter when there are segments to compare;
+        # on a short recording, lock quality has to carry the decision alone.
+        usable = [r for r in results
+                  if r['lock_pct'] >= 80.0
+                  and (len(r['segments']) < 2
+                       or float(np.std(r['segments'])) < 0.010)]
+        if not usable:
+            print("     no carrier was stable enough to calibrate against")
+            return
+        ppms = sorted(1e6 * r['delta'] / r['target'] for r in usable)
+        med = float(np.median(ppms))
+        print(f"     from {len(usable)} stable carriers: {med:+.3f} ppm")
+        print(f"     (correct with: carrier_pll.py --ppm {med:.3f} ...)\n")
+
+        print("  --- per carrier, against that clock ---")
         for r in results:
-            print(f"     {r['target']/1000:.0f} kHz: "
-                  f"{1e6 * r['delta'] / r['target']:+.3f} ppm")
-        spread = [1e6 * r['delta'] / r['target'] for r in results]
-        print(f"     spread: {max(spread) - min(spread):.3f} ppm")
-        print("     A common offset is the receiver's reference; a differing one\n"
-              "     is the transmitters themselves.")
+            p_ppm = 1e6 * r['delta'] / r['target']
+            dev_hz = (p_ppm - med) * 1e-6 * r['target']
+            sd = float(np.std(r['segments'])) if len(r['segments']) >= 2 else float('nan')
+            unstable = len(r['segments']) >= 2 and not (sd < 0.010)
+            if r['lock_pct'] < 80.0 or unstable:
+                flag = "unreliable (lock %.0f%%, sd %.0f mHz)" % (r['lock_pct'], sd * 1000)
+            elif abs(dev_hz) < 0.05:
+                flag = "on frequency"
+            else:
+                flag = "TRANSMITTER OFF by %+.3f Hz" % dev_hz
+            print(f"     {r['target']/1000:>6.0f} kHz: {p_ppm:+.3f} ppm   {flag}")
 
 
 if __name__ == '__main__':
