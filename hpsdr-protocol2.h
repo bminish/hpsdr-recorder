@@ -12,6 +12,16 @@
 #define RX_IQ_PORT 1035
 
 #define P2_BUFFER_SIZE 1500
+#define P2_BATCH_MAX 64
+
+// One received datagram. Batching with recvmmsg() matters here: at 1536 kHz
+// diversity the radio sends ~12900 packets/s, and one syscall per packet is
+// the difference between keeping up and filling the socket buffer.
+typedef struct {
+    uint8_t data[P2_BUFFER_SIZE];
+    int len;
+    uint16_t src_port;
+} p2_packet_t;
 
 typedef struct {
     char name[32];
@@ -31,6 +41,8 @@ void hpsdr_start_keepalive(uint32_t sample_rate, bool diversity_enabled, int fre
 void hpsdr_close(void);
 
 // Data polling
-int hpsdr_read_iq(uint8_t *buffer, int *bytes_read, uint16_t *src_port);
+int hpsdr_read_iq_batch(p2_packet_t *pkts, int max_pkts);
+int hpsdr_socket_rcvbuf(void);
+unsigned long long hpsdr_socket_drops(void);
 
 #endif // HPSDR_PROTOCOL2_H

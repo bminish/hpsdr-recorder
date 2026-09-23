@@ -163,6 +163,34 @@ a typical MW antenna, and attenuation only costs SNR. It applies to **both**
 ADCs deliberately; unequal attenuation would break the amplitude match the
 diversity phasing analysis depends on.
 
+## Carrier frequency measurement
+
+`carrier_pll.py` measures the average frequency of broadcast carriers to well
+below a millihertz, by downconverting, decimating to 1 kHz and running a
+second-order PLL whose total phase advance gives the average:
+
+```sh
+./carrier_pll.py recording.raw            # defaults to 909 and 693 kHz
+./carrier_pll.py recording.raw 909 693 198
+```
+
+Validated against synthetic carriers at known fractional offsets: recovered
+909000.250 Hz and 693000.137 Hz with errors of 0.000 and 0.001 **milli**hertz.
+
+In practice the air path, not the tool, sets the limit. The output reports
+per-segment averages and PLL lock percentage so this is visible: a clean
+carrier holds a few mHz across 5-minute segments, while one suffering
+co-channel interference at night can wander by tens of mHz and hold lock only
+part of the time. Treat a low lock percentage as a warning that the number
+above it is an average over several transmitters, not one.
+
+Measuring two carriers at once separates receiver from transmitter error: a
+reference that is off shifts every carrier by the same *fractional* amount, so
+a common ppm offset is the radio and a differing one is the stations.
+
+Zero-filled samples from lost packets are gated out so the loop coasts through
+them rather than being dragged toward zero.
+
 ## Exit diagnostics
 
 ```
@@ -172,6 +200,35 @@ partial writes = 0
 average write elapsed = 0.000005058
 max write elapsed = 0.001358945
 ```
+
+The link section reports where packets were lost:
+
+```
+--- link ---
+socket receive buffer = 5242880 bytes (284 ms of stream)
+sequence gaps = 0 events, 0 packets missing
+zero-filled = 0 samples (timing preserved)
+reordered/duplicate packets discarded = 0
+socket overflow drops = 0
+```
+
+`socket overflow drops` is the key attribution. Non-zero means the packets
+arrived and we were too slow to collect them — a local, fixable problem.
+Sequence gaps with *zero* socket drops mean they never arrived at all, which
+is the network.
+
+**The receive buffer is worth checking.** The recorder asks for 16 MB, but the
+kernel silently caps it at `net.core.rmem_max`, commonly 5 MB — only ~280 ms of
+this stream. On a remote or busy link, raise it:
+
+```sh
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.netdev_max_backlog=5000
+```
+
+Datagrams are collected with `recvmmsg()` in batches of up to 64. At 1536 kHz
+diversity the radio sends ~12900 packets/s, and one syscall per packet is a
+large part of what makes a receiver fall behind.
 
 Two distinct failure signatures, worth telling apart:
 

@@ -51,6 +51,7 @@ static inline void track_peak(int32_t v24, int32_t *peak) {
 }
 
 static long long overrun_events = 0;
+static int batch_max_seen = 0;
 
 // The ring holds ~11 s. If the output thread has not drained it in that time we
 // drop the incoming packet: that keeps the ring self-consistent and, unlike
@@ -76,163 +77,202 @@ static bool rx_thread_started = false;
 static volatile bool streaming_active = true;
 
 // Thread to read UDP packets and put them in the buffer
-static void *rx_thread_func(void *arg) {
-    (void)arg;
-    uint8_t buffer[P2_BUFFER_SIZE];
-    int bytes_read;
-    uint16_t src_port = 0;
-    while (streaming_active) {
-        if (hpsdr_read_iq(buffer, &bytes_read, &src_port) == 0) {
-            // ONLY process IQ data packets from RX_IQ_PORT (1035).
-            // Ignore status/register response packets from ports 1024, 1025, 1026, 1027.
-            if (src_port == RX_IQ_PORT && bytes_read >= 16) {
-                int samplesperframe = (buffer[14] << 8) | buffer[15];
-                uint32_t seq = ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) | ((uint32_t)buffer[2] << 8) | (uint32_t)buffer[3];
-                
-                // Validate before samplesperframe is used for anything: the
-                // sequence-drop handler below sizes a zero-fill from it and the
-                // sample loop indexes the packet with it. In diversity the
-                // samples arrive as ADC0/ADC1 pairs, so an odd count is
-                // malformed. Requiring the packet to actually hold the bytes -
-                // and to fit the receive buffer - is what stops the loop
-                // reading off the end of it.
-                int step = diversity ? 2 : 1;
-                int steps = samplesperframe / step;
-                int bytes_needed = 16 + steps * (diversity ? 12 : 6);
-                if (samplesperframe <= 0 || samplesperframe > 1024
-                        || (diversity && (samplesperframe % 2) != 0)
-                        || bytes_needed > bytes_read
-                        || bytes_needed > (int)sizeof(buffer)) {
-                    fprintf(stderr, "[UDP IQ] malformed packet dropped: samples-per-frame %d, %d bytes\n",
-                            samplesperframe, bytes_read);
-                    continue;
+static uint32_t expected_seq = 0;
+static bool first_pkt = true;
+
+static void process_packet(const uint8_t *buffer, int bytes_read) {
+            int samplesperframe = (buffer[14] << 8) | buffer[15];
+            uint32_t seq = ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) | ((uint32_t)buffer[2] << 8) | (uint32_t)buffer[3];
+            
+            // Validate before samplesperframe is used for anything: the
+            // sequence-drop handler below sizes a zero-fill from it and the
+            // sample loop indexes the packet with it. In diversity the
+            // samples arrive as ADC0/ADC1 pairs, so an odd count is
+            // malformed. Requiring the packet to actually hold the bytes -
+            // and to fit the receive buffer - is what stops the loop
+            // reading off the end of it.
+            int step = diversity ? 2 : 1;
+            int steps = samplesperframe / step;
+            int bytes_needed = 16 + steps * (diversity ? 12 : 6);
+            if (samplesperframe <= 0 || samplesperframe > 1024
+                    || (diversity && (samplesperframe % 2) != 0)
+                    || bytes_needed > bytes_read
+                    || bytes_needed > P2_BUFFER_SIZE) {
+                fprintf(stderr, "[UDP IQ] malformed packet dropped: samples-per-frame %d, %d bytes\n",
+                        samplesperframe, bytes_read);
+                return;
+            }
+
+            if (first_pkt) {
+                expected_seq = seq;
+                first_pkt = false;
+            } else if (seq != expected_seq) {
+                int32_t gap = (int32_t)(seq - expected_seq);
+
+                // A negative gap is a late or duplicated datagram, which a
+                // routed link can produce and a switched LAN rarely does.
+                // Appending its samples would push every later sample forward
+                // in time, so discard it and leave expected_seq alone.
+                if (gap < 0) {
+                    stats_add_reordered();
+                    return;
                 }
 
-                static uint32_t expected_seq = 0;
-                static bool first_pkt = true;
-                if (first_pkt) {
-                    expected_seq = seq;
-                    first_pkt = false;
-                } else if (seq != expected_seq) {
-                    int32_t gap = (int32_t)(seq - expected_seq);
-                    fprintf(stderr, "[UDP IQ SEQ DROP] Expected %u, got %u (gap: %d packets)\n", expected_seq, seq, gap);
-                    
-                    // Zero-fill missing packets to maintain sample rate and phase continuity
-                    if (gap > 0 && gap < 10000) {
-                        int samples_per_pkt = samplesperframe / (diversity ? 2 : 1);
-                        int total_missing_quads = gap * samples_per_pkt;
-                        int n_vals = total_missing_quads * (diversity ? 4 : 2);
-                        
-                        pthread_mutex_lock(samples_resource.lock);
-                        bool have_room =
-                            (samples_resource.nused + (unsigned int)n_vals <= samples_resource.size);
-                        int start_idx = samples_resource.write_index;
-                        if (have_room) {
-                            for (int k = 0; k < n_vals; k++) {
-                                insamples[samples_resource.write_index++] = 0;
-                                if (samples_resource.write_index >= samples_resource.size) {
-                                    samples_resource.write_index = 0;
-                                }
-                            }
-                            samples_resource.nused += n_vals;
-                        }
-                        pthread_mutex_unlock(samples_resource.lock);
+                fprintf(stderr, "[UDP IQ SEQ DROP] Expected %u, got %u (gap: %d packets)\n", expected_seq, seq, gap);
 
-                        if (!have_room) {
-                            note_overrun(total_missing_quads);
-                            expected_seq = seq;
-                            goto seq_resynced;
-                        }
+                // Zero-fill the missing packets. The radio's NCO free-runs, so
+                // inserting exactly the right number of zeroed samples keeps
+                // every later sample at its true instant - which is what makes
+                // the recording phase-coherent across a drop. An inexact count
+                // would corrupt the phase of everything that follows.
+                if (gap > 0) {
+                    int samples_per_pkt = samplesperframe / (diversity ? 2 : 1);
+                    long long missing_quads = (long long)gap * samples_per_pkt;
+                    int vals_per_quad = diversity ? 4 : 2;
+                    long long want_vals = missing_quads * vals_per_quad;
 
-                        pthread_mutex_lock(blocks_resource.lock);
-                        BlockDescriptor *block = &((BlockDescriptor*)blocks_resource.resource)[blocks_resource.write_index];
-                        block->num_samples = total_missing_quads;
-                        block->samples_index = start_idx;
-                        
-                        blocks_resource.write_index = (blocks_resource.write_index + 1) % blocks_resource.size;
-                        blocks_resource.nused++;
-                        blocks_resource.nready++;
-                        pthread_cond_signal(blocks_resource.is_ready);
-                        pthread_mutex_unlock(blocks_resource.lock);
+                    // Pad as much as the ring can take. Anything beyond it is
+                    // time we cannot represent, and it is reported rather than
+                    // quietly swallowed.
+                    pthread_mutex_lock(samples_resource.lock);
+                    long long room = (long long)samples_resource.size - samples_resource.nused;
+                    long long n_vals = want_vals <= room
+                                       ? want_vals
+                                       : (room / vals_per_quad) * vals_per_quad;
+                    pthread_mutex_unlock(samples_resource.lock);
+
+                    if (n_vals < want_vals) {
+                        stats_add_slip((want_vals - n_vals) / vals_per_quad);
                     }
-                    expected_seq = seq;
-                seq_resynced: ;
-                }
-                expected_seq++;
-
-                // Packet was validated above.
-                {
-                    int b = 16;
-                    int clipped = 0;
-                    int32_t peak = 0;
-                    unsigned int needed = (unsigned int)steps * (diversity ? 4u : 2u);
+                    int total_missing_quads = (int)(n_vals / vals_per_quad);
+                    stats_add_gap(gap, total_missing_quads);
+                    
+                    if (n_vals <= 0) {
+                        note_overrun((int)missing_quads);
+                        expected_seq = seq;
+                        goto seq_resynced;
+                    }
 
                     pthread_mutex_lock(samples_resource.lock);
-                    if (samples_resource.nused + needed > samples_resource.size) {
-                        pthread_mutex_unlock(samples_resource.lock);
-                        note_overrun(steps);
-                        continue;
-                    }
-                    int start_index = samples_resource.write_index;
-                    
-                    for (int i = 0; i < samplesperframe; i += (diversity ? 2 : 1)) {
-                        // Extract RX1 24-bit IQ and shift right 8 bits to 16-bit short
-                        int32_t i_val = (int8_t)buffer[b++] << 16;
-                        i_val |= buffer[b++] << 8;
-                        i_val |= buffer[b++];
-                        int32_t q_val = (int8_t)buffer[b++] << 16;
-                        q_val |= buffer[b++] << 8;
-                        q_val |= buffer[b++];
-                        
-                        track_peak(i_val, &peak);
-                        track_peak(q_val, &peak);
-                        insamples[samples_resource.write_index++] = pack_i(i_val, &clipped);
-                        insamples[samples_resource.write_index++] = pack_q(q_val, &clipped);
+                    int start_idx = samples_resource.write_index;
+                    for (long long k = 0; k < n_vals; k++) {
+                        insamples[samples_resource.write_index++] = 0;
                         if (samples_resource.write_index >= samples_resource.size) {
                             samples_resource.write_index = 0;
                         }
-                        
-                        if (diversity) {
-                            int32_t i_val2 = (int8_t)buffer[b++] << 16;
-                            i_val2 |= buffer[b++] << 8;
-                            i_val2 |= buffer[b++];
-                            int32_t q_val2 = (int8_t)buffer[b++] << 16;
-                            q_val2 |= buffer[b++] << 8;
-                            q_val2 |= buffer[b++];
-                            
-                            track_peak(i_val2, &peak);
-                            track_peak(q_val2, &peak);
-                            insamples[samples_resource.write_index++] = pack_i(i_val2, &clipped);
-                            insamples[samples_resource.write_index++] = pack_q(q_val2, &clipped);
-                            if (samples_resource.write_index >= samples_resource.size) {
-                                samples_resource.write_index = 0;
-                            }
-                        }
-                        
-                        samples_resource.nused += (diversity ? 4 : 2);
                     }
-
-                    if (samples_resource.nused > samples_resource.nused_max) {
-                        samples_resource.nused_max = samples_resource.nused;
-                    }
-                    
+                    samples_resource.nused += (unsigned int)n_vals;
                     pthread_mutex_unlock(samples_resource.lock);
 
-                    // Add block
                     pthread_mutex_lock(blocks_resource.lock);
                     BlockDescriptor *block = &((BlockDescriptor*)blocks_resource.resource)[blocks_resource.write_index];
-                    block->num_samples = samplesperframe / (diversity ? 2 : 1);
-                    block->samples_index = start_index;
+                    block->num_samples = total_missing_quads;
+                    block->samples_index = start_idx;
                     
                     blocks_resource.write_index = (blocks_resource.write_index + 1) % blocks_resource.size;
                     blocks_resource.nused++;
                     blocks_resource.nready++;
                     pthread_cond_signal(blocks_resource.is_ready);
                     pthread_mutex_unlock(blocks_resource.lock);
-                    
-                    stats_add_samples(samplesperframe / (diversity ? 2 : 1));
-                    stats_add_levels(clipped, peak);
                 }
+                expected_seq = seq;
+            seq_resynced: ;
+            }
+            expected_seq++;
+
+            // Packet was validated above.
+            {
+                int b = 16;
+                int clipped = 0;
+                int32_t peak = 0;
+                unsigned int needed = (unsigned int)steps * (diversity ? 4u : 2u);
+
+                pthread_mutex_lock(samples_resource.lock);
+                if (samples_resource.nused + needed > samples_resource.size) {
+                    pthread_mutex_unlock(samples_resource.lock);
+                    note_overrun(steps);
+                    return;
+                }
+                int start_index = samples_resource.write_index;
+                
+                for (int i = 0; i < samplesperframe; i += (diversity ? 2 : 1)) {
+                    // Extract RX1 24-bit IQ and shift right 8 bits to 16-bit short
+                    int32_t i_val = (int8_t)buffer[b++] << 16;
+                    i_val |= buffer[b++] << 8;
+                    i_val |= buffer[b++];
+                    int32_t q_val = (int8_t)buffer[b++] << 16;
+                    q_val |= buffer[b++] << 8;
+                    q_val |= buffer[b++];
+                    
+                    track_peak(i_val, &peak);
+                    track_peak(q_val, &peak);
+                    insamples[samples_resource.write_index++] = pack_i(i_val, &clipped);
+                    insamples[samples_resource.write_index++] = pack_q(q_val, &clipped);
+                    if (samples_resource.write_index >= samples_resource.size) {
+                        samples_resource.write_index = 0;
+                    }
+                    
+                    if (diversity) {
+                        int32_t i_val2 = (int8_t)buffer[b++] << 16;
+                        i_val2 |= buffer[b++] << 8;
+                        i_val2 |= buffer[b++];
+                        int32_t q_val2 = (int8_t)buffer[b++] << 16;
+                        q_val2 |= buffer[b++] << 8;
+                        q_val2 |= buffer[b++];
+                        
+                        track_peak(i_val2, &peak);
+                        track_peak(q_val2, &peak);
+                        insamples[samples_resource.write_index++] = pack_i(i_val2, &clipped);
+                        insamples[samples_resource.write_index++] = pack_q(q_val2, &clipped);
+                        if (samples_resource.write_index >= samples_resource.size) {
+                            samples_resource.write_index = 0;
+                        }
+                    }
+                    
+                    samples_resource.nused += (diversity ? 4 : 2);
+                }
+
+                if (samples_resource.nused > samples_resource.nused_max) {
+                    samples_resource.nused_max = samples_resource.nused;
+                }
+                
+                pthread_mutex_unlock(samples_resource.lock);
+
+                // Add block
+                pthread_mutex_lock(blocks_resource.lock);
+                BlockDescriptor *block = &((BlockDescriptor*)blocks_resource.resource)[blocks_resource.write_index];
+                block->num_samples = samplesperframe / (diversity ? 2 : 1);
+                block->samples_index = start_index;
+                
+                blocks_resource.write_index = (blocks_resource.write_index + 1) % blocks_resource.size;
+                blocks_resource.nused++;
+                blocks_resource.nready++;
+                pthread_cond_signal(blocks_resource.is_ready);
+                pthread_mutex_unlock(blocks_resource.lock);
+                
+                stats_add_samples(samplesperframe / (diversity ? 2 : 1));
+                stats_add_levels(clipped, peak);
+            }
+}
+
+static void *rx_thread_func(void *arg) {
+    (void)arg;
+    // Static: 64 x 1.5 KB is too large for the thread stack.
+    static p2_packet_t batch[P2_BATCH_MAX];
+
+    while (streaming_active) {
+        int n = hpsdr_read_iq_batch(batch, P2_BATCH_MAX);
+        if (n <= 0) {
+            continue;   // receive timeout, or the socket was closed at shutdown
+        }
+        if (n > batch_max_seen) {
+            batch_max_seen = n;
+        }
+        for (int i = 0; i < n; i++) {
+            // ONLY process IQ data packets from RX_IQ_PORT (1035).
+            // Ignore status/register responses from ports 1024-1027.
+            if (batch[i].src_port == RX_IQ_PORT && batch[i].len >= 16) {
+                process_packet(batch[i].data, batch[i].len);
             }
         }
     }

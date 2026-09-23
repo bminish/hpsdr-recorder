@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "hpsdr-protocol2.h"
 #include "config.h"
 #include <stdio.h>
@@ -15,6 +16,10 @@ static struct sockaddr_in radio_addr_general;
 static struct sockaddr_in radio_addr_rx;
 static struct sockaddr_in radio_addr_tx;
 static struct sockaddr_in radio_addr_hp;
+
+static int rcvbuf_granted = 0;
+static uint32_t last_rxq_ovfl = 0;
+static unsigned long long sock_drops_total = 0;
 
 static uint32_t general_sequence = 0;
 static uint32_t rx_sequence = 0;
@@ -103,9 +108,20 @@ int hpsdr_connect(const char *ip_addr) {
     setsockopt(data_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
     setsockopt(data_socket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
     
-    // Maximize receive buffer for deep buffering
+    // Maximize receive buffer for deep buffering. The kernel silently caps this
+    // at net.core.rmem_max, so read back what we actually got: a request for
+    // 16 MB commonly lands at 5 MB, which is only ~280 ms of this stream.
     int rcvbuf = 1024 * 1024 * 16; // 16MB
     setsockopt(data_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    socklen_t optlen = sizeof(rcvbuf_granted);
+    if (getsockopt(data_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_granted, &optlen) == 0) {
+        rcvbuf_granted /= 2; // kernel reports double the usable size
+    }
+
+    // Ask the kernel to tell us how many datagrams it dropped for this socket,
+    // which separates "we were too slow" from "it never arrived".
+    int on = 1;
+    setsockopt(data_socket, SOL_SOCKET, SO_RXQ_OVFL, &on, sizeof(on));
 
     struct timeval tv;
     tv.tv_sec = 1;
@@ -430,14 +446,57 @@ void hpsdr_close(void) {
     }
 }
 
-int hpsdr_read_iq(uint8_t *buffer, int *bytes_read, uint16_t *src_port) {
+int hpsdr_socket_rcvbuf(void) {
+    return rcvbuf_granted;
+}
+
+unsigned long long hpsdr_socket_drops(void) {
+    return sock_drops_total;
+}
+
+// Receives up to max_pkts datagrams in one syscall. MSG_WAITFORONE returns as
+// soon as at least one has arrived, so latency is unchanged when the link is
+// quiet but syscalls collapse by ~60x when it is busy.
+int hpsdr_read_iq_batch(p2_packet_t *pkts, int max_pkts) {
     if (data_socket < 0) return -1;
-    
-    struct sockaddr_in from_addr;
-    socklen_t from_len = sizeof(from_addr);
-    *bytes_read = recvfrom(data_socket, buffer, P2_BUFFER_SIZE, 0, (struct sockaddr *)&from_addr, &from_len);
-    if (src_port && *bytes_read > 0) {
-        *src_port = ntohs(from_addr.sin_port);
+    if (max_pkts > P2_BATCH_MAX) max_pkts = P2_BATCH_MAX;
+
+    struct mmsghdr msgs[P2_BATCH_MAX];
+    struct iovec iovs[P2_BATCH_MAX];
+    struct sockaddr_in addrs[P2_BATCH_MAX];
+    char ctrl[P2_BATCH_MAX][CMSG_SPACE(sizeof(uint32_t))];
+
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < max_pkts; i++) {
+        iovs[i].iov_base = pkts[i].data;
+        iovs[i].iov_len = P2_BUFFER_SIZE;
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &addrs[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+        msgs[i].msg_hdr.msg_control = ctrl[i];
+        msgs[i].msg_hdr.msg_controllen = sizeof(ctrl[i]);
     }
-    return (*bytes_read > 0) ? 0 : -1;
+
+    int n = recvmmsg(data_socket, msgs, max_pkts, MSG_WAITFORONE, NULL);
+    if (n <= 0) {
+        return n;
+    }
+
+    for (int i = 0; i < n; i++) {
+        pkts[i].len = (int)msgs[i].msg_len;
+        pkts[i].src_port = ntohs(addrs[i].sin_port);
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&msgs[i].msg_hdr); c != NULL;
+             c = CMSG_NXTHDR(&msgs[i].msg_hdr, c)) {
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_RXQ_OVFL) {
+                uint32_t v;
+                memcpy(&v, CMSG_DATA(c), sizeof(v));
+                if (v != last_rxq_ovfl) {
+                    sock_drops_total += (unsigned long long)(uint32_t)(v - last_rxq_ovfl);
+                    last_rxq_ovfl = v;
+                }
+            }
+        }
+    }
+    return n;
 }

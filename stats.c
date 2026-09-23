@@ -1,5 +1,6 @@
 #include "stats.h"
 #include "config.h"
+#include "hpsdr-protocol2.h"
 #include <stdio.h>
 #include <math.h>
 
@@ -8,6 +9,11 @@ static long long total_clipped = 0;
 static int32_t peak_sample = 0;
 long long stats_amp_hist[STATS_HIST_BINS];
 static long long total_lost = 0;
+static long long gap_events = 0;
+static long long gap_packets = 0;
+static long long gap_samples_padded = 0;
+static long long reordered_packets = 0;
+static long long slipped_samples = 0;
 static long long total_writes = 0;
 static long long partial_writes = 0;
 static long long failed_writes = 0;
@@ -28,6 +34,20 @@ void stats_add_write(double elapsed, int partial, long long failed_bytes_in) {
     }
     write_elapsed_total += elapsed;
     if (elapsed > write_elapsed_max) write_elapsed_max = elapsed;
+}
+
+void stats_add_gap(int packets, int samples_padded) {
+    gap_events++;
+    gap_packets += packets;
+    gap_samples_padded += samples_padded;
+}
+
+void stats_add_reordered(void) {
+    reordered_packets++;
+}
+
+void stats_add_slip(long long samples) {
+    slipped_samples += samples;
 }
 
 void stats_add_lost(int samples) {
@@ -99,7 +119,25 @@ int print_stats(void) {
                total_lost, mbps);
     }
 
+    printf("\n--- link ---\n");
+    printf("socket receive buffer = %d bytes (%.0f ms of stream)\n",
+           hpsdr_socket_rcvbuf(),
+           1000.0 * hpsdr_socket_rcvbuf() / (sample_rate * (diversity ? 2.0 : 1.0) * 6.0));
+    printf("sequence gaps = %lld events, %lld packets missing\n", gap_events, gap_packets);
+    printf("zero-filled = %lld samples (timing preserved)\n", gap_samples_padded);
+    printf("reordered/duplicate packets discarded = %lld\n", reordered_packets);
+    if (slipped_samples > 0) {
+        printf("UNPADDED SLIP: %lld samples -- timing after this point has shifted\n",
+               slipped_samples);
+    }
+    printf("socket overflow drops = %llu%s\n", hpsdr_socket_drops(),
+           hpsdr_socket_drops() > 0 ? "  <- arrived but we were too slow (local, fixable)" : "");
+    if (gap_packets > 0 && hpsdr_socket_drops() == 0) {
+        printf("  (no socket overflow: the missing packets never arrived -- network loss)\n");
+    }
+
     if (total_writes > 0) {
+        printf("\n--- disk ---\n");
         printf("total writes = %lld\n", total_writes);
         printf("full writes = %lld\n", total_writes - partial_writes);
         printf("partial writes = %lld\n", partial_writes);
