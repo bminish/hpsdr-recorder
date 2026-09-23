@@ -124,91 +124,102 @@ class PLL:
         self.phase, self.freq = phase, freq
 
 
-def measure(path, hdr, target_hz, max_seconds=None):
+class Carrier:
+    """Per-carrier state for a single shared pass over the file."""
+
+    def __init__(self, target_hz, hdr, block):
+        self.target = target_hz
+        self.offset = target_hz - hdr['centre']
+        # The mixer table is precomputed once for a whole block. Every block
+        # starts at the same mixer phase (the offsets are multiples of 1 kHz and
+        # the block is a multiple of 1536 samples, so a whole number of cycles
+        # fits in each block), which removes all transcendental work from the
+        # inner loop.
+        n = np.arange(block, dtype=np.float64)
+        self.mix = np.exp(-2j * np.pi * self.offset * n / hdr['fs']).astype(np.complex64)
+        self.stages, self.dec_fs = make_decimators(hdr['fs'])
+        self.pll = PLL(self.dec_fs)
+
+
+def measure_all(path, hdr, targets, max_seconds=None):
+    """Measure every carrier in one pass. Reading a 44 GB file once instead of
+    once per carrier is the difference between minutes and half an hour."""
     fs, nch, centre = hdr['fs'], hdr['nch'], hdr['centre']
     frame = nch * 2
-    offset = target_hz - centre                     # baseband offset, Hz
-    if abs(offset) > 0.45 * fs:
-        return None
 
-    stages, dec_fs = make_decimators(fs)
-    pll = PLL(dec_fs)
+    block = 1536 * 1365                       # multiple of the decimation product
+    usable = [f for f in targets if abs(f - centre) <= 0.45 * fs]
+    carriers = [Carrier(f, hdr, block) for f in usable]
+    if not carriers:
+        return []
 
     total_samples = (os.path.getsize(path) - 41) // frame
     if max_seconds:
         total_samples = min(total_samples, int(max_seconds * fs))
-    block = (1 << 20) * 4
-    block -= block % np.prod(DEC_STAGES)            # keep stages aligned
 
     n0 = 0
     zero_run = 0
-    with open(path, 'rb') as fh:
-        fh.seek(41)
-        while n0 < total_samples:
+    noise = []                                 # per-block wideband level
+    while n0 < total_samples:
+        with open(path, 'rb') as fh:
+            fh.seek(41 + n0 * frame)
             want = int(min(block, total_samples - n0))
             raw = np.frombuffer(fh.read(want * frame), dtype='<i2')
-            # raw.size counts int16 elements, not bytes: nch of them per instant
-            if raw.size < want * nch:
-                want = raw.size // nch
-                if want == 0:
-                    break
-                raw = raw[:want * nch]
-            x = raw.reshape(-1, nch)
-            sig = x[:, 0].astype(np.float32) + 1j * x[:, 1].astype(np.float32)
+        if raw.size < want * nch:
+            want = raw.size // nch
+            if want == 0:
+                break
+            raw = raw[:want * nch]
+        x = raw.reshape(-1, nch)
+        sig = x[:, 0].astype(np.float32) + 1j * x[:, 1].astype(np.float32)
 
-            # Exact mixer phase: keep the sample index in integers so precision
-            # does not decay over a multi-hour file.
-            n = np.arange(n0, n0 + want, dtype=np.int64)
-            num = (np.int64(round(offset)) * n) % fs
-            frac = (offset - round(offset)) * n
-            ph = -2.0 * np.pi * (num / fs + frac / fs)
-            sig = sig * np.exp(1j * ph)
+        # Zero-fill shows up as runs; isolated (0,0) samples are just the
+        # signal crossing zero and there are millions of those at low levels.
+        zeros = (x[:, 0] == 0) & (x[:, 1] == 0)
+        if zeros.any():
+            edges = np.flatnonzero(np.diff(np.concatenate(([0], zeros.view(np.int8), [0]))))
+            runs = edges[1::2] - edges[0::2]
+            zero_run += int(runs[runs >= ZERO_RUN_MIN].sum())
 
-            # Zero-fill from a lost packet arrives as a RUN of at least one
-            # packet's worth of samples. Isolated (0,0) samples are just the
-            # signal crossing zero, and at low levels there are millions of
-            # them - counting those was badly misleading.
-            zeros = (x[:, 0] == 0) & (x[:, 1] == 0)
-            if zeros.any():
-                edges = np.flatnonzero(np.diff(np.concatenate(([0], zeros.view(np.int8), [0]))))
-                starts, ends = edges[0::2], edges[1::2]
-                runs = ends - starts
-                zero_run += int(runs[runs >= ZERO_RUN_MIN].sum())
+        noise.append(float(np.sqrt(np.mean(np.abs(sig) ** 2))))
 
-            d = decimate(stages, sig)
-            # A decimated sample is trusted only if it is not tiny (zero-fill
-            # regions and deep fades both show up this way).
+        for c in carriers:
+            d = decimate(c.stages, sig * c.mix[:want])
             mag = np.abs(d)
             ref = np.median(mag[mag > 0]) if np.any(mag > 0) else 0.0
             gate = mag > 0.05 * ref if ref > 0 else np.zeros(len(d), bool)
-            pll.run(d, gate)
+            c.pll.run(d, gate)
 
-            n0 += want
+        n0 += want
 
-    if pll.total == 0 or pll.locked == 0 or pll.mark_phase is None:
-        return None
-
-    # Average frequency over the settled interval only
-    span_n = pll.total - pll.mark_n
-    if span_n <= 0:
-        return None
-    seconds = span_n / dec_fs
-    delta_f = (pll.phase - pll.mark_phase) / (2 * np.pi * seconds)
-
-    return {
-        'target': target_hz,
-        'measured': target_hz + delta_f,
-        'delta': delta_f,
-        'seconds': seconds,
-        'lock_pct': 100.0 * pll.locked / pll.total,
-        'coast_pct': 100.0 * pll.coasted / pll.total,
-        'zero_samples': zero_run,
-        'segments': [
-            (pll.marks[i + 1][1] - pll.marks[i][1]) /
-            (2 * np.pi * (pll.marks[i + 1][0] - pll.marks[i][0]) / dec_fs)
-            for i in range(len(pll.marks) - 1)
-        ],
-    }
+    results = []
+    for c in carriers:
+        pll = c.pll
+        if pll.total == 0 or pll.locked == 0 or pll.mark_phase is None:
+            results.append({'target': c.target, 'failed': True})
+            continue
+        span_n = pll.total - pll.mark_n
+        if span_n <= 0:
+            results.append({'target': c.target, 'failed': True})
+            continue
+        seconds = span_n / c.dec_fs
+        delta_f = (pll.phase - pll.mark_phase) / (2 * np.pi * seconds)
+        results.append({
+            'target': c.target,
+            'measured': c.target + delta_f,
+            'delta': delta_f,
+            'seconds': seconds,
+            'lock_pct': 100.0 * pll.locked / pll.total,
+            'coast_pct': 100.0 * pll.coasted / pll.total,
+            'zero_samples': zero_run,
+            'failed': False,
+            'segments': [
+                (pll.marks[i + 1][1] - pll.marks[i][1]) /
+                (2 * np.pi * (pll.marks[i + 1][0] - pll.marks[i][0]) / c.dec_fs)
+                for i in range(len(pll.marks) - 1)
+            ],
+        })
+    return results
 
 
 def main():
@@ -229,13 +240,9 @@ def main():
     print(f"  centre {hdr['centre']/1000:.3f} kHz, {hdr['fs']} Hz, "
           f"{hdr['nch']} AD channels\n")
 
-    results = []
-    for f in freqs:
-        r = measure(path, hdr, f)
-        if r is None:
-            print(f"  {f/1000:.0f} kHz: out of band or no carrier found")
-            continue
-        results.append(r)
+    results = [r for r in measure_all(path, hdr, freqs) if not r.get('failed')]
+    for r in results:
+        f = r['target']
         print(f"  {f/1000:.0f} kHz")
         print(f"     average frequency : {r['measured']:.3f} Hz "
               f"({r['delta']:+.3f} Hz from nominal)")
