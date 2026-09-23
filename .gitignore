@@ -14,3 +14,7 @@
 # Crash dumps
 vgcore.*
 core.*
+
+# Python bytecode
+__pycache__/
+*.pyc
