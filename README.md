@@ -60,7 +60,7 @@ silently ignored. Both spellings of each key are accepted.
 | `streaming time`, `streaming_time`, `duration` | Seconds; 0 = until Ctrl+C |
 | `output file`, `output_file` | Filename template |
 | `output type`, `output_type` | Only `Linrad` is supported |
-| `freq_correction` | Calibration offset in Hz; normally 0 |
+| `freq_correction` | Constant offset in whole Hz; normally 0. Cannot correct a ppm/scale error — see below |
 | `new_pa_board`, `alex_new_pa_board` | 1 for Rev.24 PA board |
 | `socket buffer`, `socket_buffer`, `rcvbuf_mb` | UDP receive buffer in MB |
 
@@ -189,6 +189,26 @@ above it is an average over several transmitters, not one.
 Measuring two carriers at once separates receiver from transmitter error: a
 reference that is off shifts every carrier by the same *fractional* amount, so
 a common ppm offset is the radio and a differing one is the stations.
+
+### Correcting a receiver clock error
+
+A clock error is a **scale** error, not an offset. A clock 0.323 ppm low puts
+693 kHz up by 0.224 Hz, 909 kHz up by 0.294 Hz and 1500 kHz up by 0.485 Hz —
+no single constant cancels all three, and the sample rate is stretched by the
+same factor regardless of where the NCO sits. **Do not try to fix this with
+`freq_correction`**, which is a constant in whole Hz: at 950 kHz the correction
+needed is 0.307 Hz, and the smallest value that knob accepts is 1 Hz, which
+would treble the error.
+
+Apply it at analysis time instead, where it is a scale and costs nothing:
+
+```sh
+./carrier_pll.py --ppm 0.323 recording.raw 909 693
+```
+
+Measured on this setup, that single factor brings two carriers 216 kHz apart
+onto nominal within 3 mHz — which a constant offset could not do. The proper
+fix at source is to lock the radio to an external 10 MHz reference.
 
 Zero-filled samples from lost packets are gated out so the loop coasts through
 them rather than being dragged toward zero.

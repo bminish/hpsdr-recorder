@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Measure the average frequency of broadcast carriers in a Linrad .raw recording.
 
-Usage: carrier_pll.py <file.raw> [freq_kHz ...]        (default: 909 693)
+Usage: carrier_pll.py [--ppm P] <file.raw> [freq_kHz ...]     (default: 909 693)
+
+  --ppm P   correct a known receiver clock error of P ppm. A clock error is a
+            scale error, so it must be applied as one: true = measured*(1-P/1e6).
+            Do NOT try to correct this with the recorder's freq_correction,
+            which is a constant offset in whole Hz and cannot cancel a scale.
 
 For each carrier it downconverts, decimates to 1 kHz, and runs a second-order
 PLL. The average frequency is taken from the PLL's total phase advance over the
@@ -210,8 +215,14 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(1)
-    path = sys.argv[1]
-    freqs = [float(a) * 1000.0 for a in sys.argv[2:]] or [909000.0, 693000.0]
+    args = sys.argv[1:]
+    ppm = 0.0
+    if '--ppm' in args:
+        i = args.index('--ppm')
+        ppm = float(args[i + 1])
+        del args[i:i + 2]
+    path = args[0]
+    freqs = [float(a) * 1000.0 for a in args[1:]] or [909000.0, 693000.0]
 
     hdr = read_header(path)
     print(f"{path}")
@@ -228,6 +239,10 @@ def main():
         print(f"  {f/1000:.0f} kHz")
         print(f"     average frequency : {r['measured']:.3f} Hz "
               f"({r['delta']:+.3f} Hz from nominal)")
+        if ppm:
+            corr = r['measured'] * (1.0 - ppm * 1e-6)
+            print(f"     clock-corrected   : {corr:.3f} Hz "
+                  f"({corr - r['target']:+.3f} Hz from nominal, {ppm:+.3f} ppm applied)")
         print(f"     over              : {r['seconds']:.1f} s")
         print(f"     PLL locked        : {r['lock_pct']:.1f} %  "
               f"(coasted {r['coast_pct']:.2f} % on zero-fill/fades)")
