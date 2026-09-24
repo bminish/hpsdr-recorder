@@ -19,3 +19,22 @@ gcc -g -O1 -I.. -o test_zerofill test_zerofill.c ../config.c ../buffers.c \
 
 A single sample of timing slip would show as a 23.4 degree phase error, so the
 check has roughly 2000x margin over the failure it is looking for.
+
+## test_adc_setup.c
+
+Dumps the bytes that actually configure ADC1 (ch2) — step attenuator, dither,
+random, DDC/ADC assignment and sync — by wrapping `sendto()` and decoding by
+destination port, so it reports what goes on the wire rather than what the
+code appears to say.
+
+```sh
+gcc -O1 -I.. -o test_adc_setup test_adc_setup.c ../config.c ../hpsdr-protocol2.c \
+    -lpthread -lm -Wl,--wrap=sendto
+./test_adc_setup
+```
+
+On Angelia, ADC1 has exactly three settable parameters in Protocol 2: the step
+attenuator (high-priority byte 1442), and its dither and random bits (receive-
+specific bytes 5 and 6, bit 1 each). There is no positive gain control — the
+attenuator only subtracts — so 0 dB is already maximum sensitivity and any
+further improvement to that arm has to be external to the radio.
