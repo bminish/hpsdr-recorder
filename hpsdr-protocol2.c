@@ -453,6 +453,10 @@ void hpsdr_close(void) {
     }
 }
 
+uint32_t hpsdr_radio_ip(void) {
+    return radio_addr_general.sin_addr.s_addr;
+}
+
 int hpsdr_socket_rcvbuf(void) {
     return rcvbuf_granted;
 }
@@ -474,6 +478,7 @@ int hpsdr_read_iq_batch(p2_packet_t *pkts, int max_pkts) {
     char ctrl[P2_BATCH_MAX][CMSG_SPACE(sizeof(uint32_t))];
 
     memset(msgs, 0, sizeof(msgs));
+    memset(addrs, 0, sizeof(addrs));
     for (int i = 0; i < max_pkts; i++) {
         iovs[i].iov_base = pkts[i].data;
         iovs[i].iov_len = P2_BUFFER_SIZE;
@@ -493,6 +498,7 @@ int hpsdr_read_iq_batch(p2_packet_t *pkts, int max_pkts) {
     for (int i = 0; i < n; i++) {
         pkts[i].len = (int)msgs[i].msg_len;
         pkts[i].src_port = ntohs(addrs[i].sin_port);
+        pkts[i].src_ip = addrs[i].sin_addr.s_addr;
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&msgs[i].msg_hdr); c != NULL;
              c = CMSG_NXTHDR(&msgs[i].msg_hdr, c)) {
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_RXQ_OVFL) {

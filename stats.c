@@ -1,6 +1,7 @@
 #include "stats.h"
 #include "config.h"
 #include "hpsdr-protocol2.h"
+#include "streaming.h"
 #include <stdio.h>
 #include <math.h>
 
@@ -48,6 +49,10 @@ void stats_add_reordered(void) {
 
 void stats_add_slip(long long samples) {
     slipped_samples += samples;
+}
+
+long long stats_total_samples(void) {
+    return total_samples;
 }
 
 void stats_add_lost(int samples) {
@@ -129,6 +134,10 @@ int print_stats(void) {
     if (slipped_samples > 0) {
         printf("UNPADDED SLIP: %lld samples -- timing after this point has shifted\n",
                slipped_samples);
+    }
+    if (streaming_foreign_iq() > 0) {
+        printf("FOREIGN IQ DISCARDED = %lld packets from another device on port 1035\n",
+               streaming_foreign_iq());
     }
     printf("socket overflow drops = %llu%s\n", hpsdr_socket_drops(),
            hpsdr_socket_drops() > 0 ? "  <- arrived but we were too slow (local, fixable)" : "");

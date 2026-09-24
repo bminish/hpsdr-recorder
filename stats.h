@@ -17,5 +17,6 @@ void stats_add_reordered(void);
 void stats_add_slip(long long samples);
 void stats_add_write(double elapsed, int partial, long long failed_bytes);
 int print_stats(void);
+long long stats_total_samples(void);
 
 #endif // STATS_H

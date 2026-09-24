@@ -21,6 +21,7 @@ typedef struct {
     uint8_t data[P2_BUFFER_SIZE];
     int len;
     uint16_t src_port;
+    uint32_t src_ip;      // network byte order
 } p2_packet_t;
 
 typedef struct {
@@ -43,6 +44,7 @@ void hpsdr_close(void);
 // Data polling
 int hpsdr_read_iq_batch(p2_packet_t *pkts, int max_pkts);
 int hpsdr_socket_rcvbuf(void);
+uint32_t hpsdr_radio_ip(void);
 unsigned long long hpsdr_socket_drops(void);
 
 #endif // HPSDR_PROTOCOL2_H

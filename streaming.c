@@ -4,9 +4,11 @@
 #include "config.h"
 #include "stats.h"
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 // The radio gives 24-bit samples and the Linrad file holds 16-bit, so
 // sample_shift bits are dropped. The default 8 keeps the ADC's top 16 bits and
@@ -52,6 +54,70 @@ static inline void track_peak(int32_t v24, int32_t *peak) {
 
 static long long overrun_events = 0;
 static int batch_max_seen = 0;
+
+// Packets seen per source port. The radio answers on 1024-1027 even when it is
+// not streaming IQ on 1035, so this distinguishes "radio is not talking to us
+// at all" from "radio is talking but will not stream".
+static volatile long long pkt_by_port[6];   // 1024,1025,1026,1027,1035,other
+static volatile long long pkt_total;
+static uint8_t first_other[16];
+static uint32_t seen_ip[4];
+static long long seen_ip_count[4];
+static int seen_ips = 0;
+static volatile long long foreign_iq;
+static int first_other_port = -1;
+static int first_other_len;
+
+static int port_slot(uint16_t port) {
+    switch (port) {
+        case 1024: return 0;
+        case 1025: return 1;
+        case 1026: return 2;
+        case 1027: return 3;
+        case RX_IQ_PORT: return 4;
+        default: return 5;
+    }
+}
+
+long long streaming_iq_packets(void) {
+    return pkt_by_port[4];
+}
+
+long long streaming_foreign_iq(void) {
+    return foreign_iq;
+}
+
+void streaming_port_report(void) {
+    static const char *names[6] = {
+        "1024 general/status", "1025 rx-specific", "1026 tx-specific",
+        "1027 high-priority", "1035 IQ DATA", "other"
+    };
+    fprintf(stderr, "  packets received: %lld total\n", pkt_total);
+    for (int i = 0; i < 6; i++) {
+        if (pkt_by_port[i] > 0) {
+            fprintf(stderr, "    %-22s %lld\n", names[i], pkt_by_port[i]);
+        }
+    }
+    for (int i = 0; i < seen_ips; i++) {
+        struct in_addr a; a.s_addr = seen_ip[i];
+        fprintf(stderr, "    from %-16s %lld packets\n", inet_ntoa(a), seen_ip_count[i]);
+    }
+    if (pkt_total == 0) {
+        fprintf(stderr, "    nothing at all from the radio -- check it is powered and\n"
+                        "    reachable, and that no other client (piHPSDR, Thetis) holds it\n");
+    } else if (pkt_by_port[4] == 0) {
+        fprintf(stderr, "    the radio IS responding but is not streaming IQ:\n"
+                        "    it is likely streaming to a different client, or it rejected\n"
+                        "    the receiver-specific setup\n");
+        if (first_other_port >= 0) {
+            fprintf(stderr, "    first reply from port %d, %d bytes:", first_other_port, first_other_len);
+            for (int i = 0; i < first_other_len && i < 16; i++) {
+                fprintf(stderr, " %02X", first_other[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
 
 // The ring holds ~11 s. If the output thread has not drained it in that time we
 // drop the incoming packet: that keeps the ring self-consistent and, unlike
@@ -269,7 +335,31 @@ static void *rx_thread_func(void *arg) {
             batch_max_seen = n;
         }
         for (int i = 0; i < n; i++) {
-            // ONLY process IQ data packets from RX_IQ_PORT (1035).
+            pkt_total++;
+            pkt_by_port[port_slot(batch[i].src_port)]++;
+            {
+                int k;
+                for (k = 0; k < seen_ips; k++) {
+                    if (seen_ip[k] == batch[i].src_ip) break;
+                }
+                if (k < 4) {
+                    if (k == seen_ips) { seen_ip[k] = batch[i].src_ip; seen_ips++; }
+                    seen_ip_count[k]++;
+                }
+            }
+            if (batch[i].src_port != RX_IQ_PORT && first_other_port < 0) {
+                first_other_port = batch[i].src_port;
+                first_other_len = batch[i].len < 16 ? batch[i].len : 16;
+                memcpy(first_other, batch[i].data, (size_t)first_other_len);
+            }
+            // ONLY process IQ from the radio we are actually talking to. The
+            // port alone is not enough: another HPSDR device on the same LAN
+            // streaming to 1035 would otherwise be interleaved into the
+            // recording, silently corrupting it.
+            if (batch[i].src_port == RX_IQ_PORT && batch[i].src_ip != hpsdr_radio_ip()) {
+                foreign_iq++;
+                continue;
+            }
             // Ignore status/register responses from ports 1024-1027.
             if (batch[i].src_port == RX_IQ_PORT && batch[i].len >= 16) {
                 process_packet(batch[i].data, batch[i].len);

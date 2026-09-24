@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 
 static volatile bool keep_running = true;
 
@@ -26,6 +27,58 @@ void main_exit(int exit_status) {
     output_close();
     buffers_free();
     exit(exit_status);
+}
+
+// Sends the full receiver setup. Verbose on purpose: when the radio does not
+// stream, knowing exactly which packet failed is the first thing you want.
+static int send_radio_config(int attempt, int attempts) {
+    printf("Configuring radio (attempt %d/%d)...\n", attempt, attempts);
+
+    if (hpsdr_configure_general(false, false) < 0) {
+        fprintf(stderr, "  general packet     -> port %d  FAILED: %s\n",
+                GENERAL_REGISTERS_PORT, strerror(errno));
+        return -1;
+    }
+    printf("  general packet     -> port %d  ok\n", GENERAL_REGISTERS_PORT);
+
+    if (hpsdr_configure_transmitter_disabled() < 0) {
+        fprintf(stderr, "  tx-disable packet  -> port %d  FAILED: %s\n",
+                TRANSMITTER_SPECIFIC_REGISTERS_PORT, strerror(errno));
+        return -1;
+    }
+    printf("  tx-disable packet  -> port %d  ok\n", TRANSMITTER_SPECIFIC_REGISTERS_PORT);
+
+    if (hpsdr_configure_receiver(sample_rate, diversity, 0, 0) < 0) {
+        fprintf(stderr, "  rx-specific packet -> port %d  FAILED: %s\n",
+                RECEIVER_SPECIFIC_REGISTERS_PORT, strerror(errno));
+        return -1;
+    }
+    printf("  rx-specific packet -> port %d  ok  (%d ADCs, %d Hz, 24 bit)\n",
+           RECEIVER_SPECIFIC_REGISTERS_PORT, diversity ? 2 : 1, sample_rate);
+
+    if (hpsdr_configure_high_priority(rx1_freq, rx2_freq) < 0) {
+        fprintf(stderr, "  high-priority      -> port %d  FAILED: %s\n",
+                HIGH_PRIORITY_PORT, strerror(errno));
+        return -1;
+    }
+    printf("  high-priority      -> port %d  ok\n", HIGH_PRIORITY_PORT);
+    return 0;
+}
+
+// Waits for the IQ stream to actually start. Returns 0 once samples arrive.
+static int wait_for_stream(double seconds) {
+    long long start_samples = stats_total_samples();
+    long long start_iq = streaming_iq_packets();
+    int ticks = (int)(seconds * 10);
+    for (int i = 0; i < ticks && keep_running; i++) {
+        usleep(100000);
+        if (stats_total_samples() > start_samples) {
+            printf("  IQ stream running (%lld packets in %.1f s)\n",
+                   streaming_iq_packets() - start_iq, (i + 1) / 10.0);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int main(int argc, char *argv[]) {
@@ -70,24 +123,43 @@ int main(int argc, char *argv[]) {
         main_exit(EXIT_FAILURE);
     }
 
-    // Explicitly disable PA, Alex based on config
-    if (hpsdr_configure_general(false, false) < 0) {
-        fprintf(stderr, "Failed to send general config\n");
-        main_exit(EXIT_FAILURE);
+    // Configure, then confirm the radio actually streams. A recording that
+    // silently captures nothing is worse than one that fails loudly, so this
+    // retries and then exits non-zero rather than producing an empty file.
+    const int attempts = 3;
+    int streaming_ok = 0;
+    for (int attempt = 1; attempt <= attempts && keep_running; attempt++) {
+        if (send_radio_config(attempt, attempts) < 0) {
+            main_exit(EXIT_FAILURE);
+        }
+        if (attempt == 1) {
+            // Keepalive must run for the radio to keep streaming
+            hpsdr_start_keepalive(sample_rate, diversity, rx1_freq, rx2_freq);
+        }
+        printf("Waiting for IQ stream...\n");
+        if (wait_for_stream(5.0) == 0) {
+            streaming_ok = 1;
+            break;
+        }
+        fprintf(stderr, "  NO IQ SAMPLES after 5.0 s\n");
+        streaming_port_report();
+        if (attempt < attempts) {
+            fprintf(stderr, "  retrying configuration...\n");
+        }
     }
 
-    if (hpsdr_configure_transmitter_disabled() < 0) {
-        fprintf(stderr, "Failed to send tx config\n");
+    if (!streaming_ok) {
+        if (!keep_running) {
+            fprintf(stderr, "Interrupted before the stream started.\n");
+        } else {
+            fprintf(stderr,
+                    "ERROR: radio at %s never started streaming after %d attempts.\n"
+                    "       Nothing was recorded; exiting non-zero so a scheduled run\n"
+                    "       is not mistaken for a successful capture.\n",
+                    ip_address, attempts);
+        }
         main_exit(EXIT_FAILURE);
     }
-
-    if (hpsdr_configure_receiver(sample_rate, diversity, 0, 0) < 0) {
-        fprintf(stderr, "Failed to send rx config\n");
-        main_exit(EXIT_FAILURE);
-    }
-    
-    // NOW start keepalive thread to trigger radio streaming after RX thread is ready
-    hpsdr_start_keepalive(sample_rate, diversity, rx1_freq, rx2_freq);
     
     printf("Tuning RX1 %d Hz, RX2 %d Hz (DDC correction %+d Hz)\n",
            rx1_freq, rx2_freq, freq_correction);
@@ -114,7 +186,12 @@ int main(int argc, char *argv[]) {
     printf("\nStopping recording...\n");
     
     print_stats();
-    
+
+    if (stats_total_samples() == 0) {
+        fprintf(stderr, "ERROR: the stream stopped and no samples were recorded.\n");
+        main_exit(EXIT_FAILURE);
+    }
+
     main_exit(EXIT_SUCCESS);
     return 0;
 }
