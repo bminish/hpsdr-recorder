@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "output.h"
 #include "buffers.h"
 #include "config.h"
@@ -37,6 +38,43 @@ static int outputfd = -1;
 static pthread_t output_thread;
 static bool output_thread_started = false;
 static long long write_error_events = 0;
+static off_t written_bytes = 0;
+static off_t chunk_start = 0;
+static off_t sync_off = 0;
+static off_t sync_len = 0;
+
+// Coalesce up to ~1 MB per write. Consecutive blocks are contiguous in the
+// ring (one RX thread appends samples and descriptors in order), so N ready
+// blocks are a single span. Writing them one at a time cost one syscall per
+// received packet - ~12900/s of under 1 KB each.
+#define COALESCE_MAX_VALUES (512 * 1024)
+#define DRAIN_INTERVAL_MS   50
+#define DRAIN_TARGET_BLOCKS 1024
+
+// Every byte here is write-once and never read back, but it all lands in the
+// page cache: an hour-long capture evicts 44 GB of other applications' data.
+// Start writeback on the chunk just finished, then release the one before it,
+// which by then is clean. Only the older chunk is waited on, so this does not
+// stall the writer.
+#define CACHE_CHUNK_BYTES (8 * 1024 * 1024)
+
+static void release_page_cache(void) {
+    if (written_bytes - chunk_start < CACHE_CHUNK_BYTES) {
+        return;
+    }
+    off_t off = chunk_start;
+    off_t len = written_bytes - chunk_start;
+    sync_file_range(outputfd, off, len, SYNC_FILE_RANGE_WRITE);
+    if (sync_len > 0) {
+        sync_file_range(outputfd, sync_off, sync_len,
+                        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                        SYNC_FILE_RANGE_WAIT_AFTER);
+        posix_fadvise(outputfd, sync_off, sync_len, POSIX_FADV_DONTNEED);
+    }
+    sync_off = off;
+    sync_len = len;
+    chunk_start = written_bytes;
+}
 static volatile bool output_active = true;
 
 static int write_linrad_header() {
@@ -107,6 +145,7 @@ static void timed_write(const void *buf, size_t len) {
 
     double elapsed = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
     long long lost = (long long)(len - done);
+    written_bytes += (off_t)done;
 
     if (lost > 0) {
         write_error_events++;
@@ -123,47 +162,77 @@ static void *output_thread_func(void *arg) {
     (void)arg;
     
     while (output_active) {
+        // Drain on a timer, not per packet. The ring holds ~11 s, so letting
+        // 50 ms accumulate costs nothing and turns ~12900 tiny writes per
+        // second into ~20 large ones. The condvar is now only used to make
+        // shutdown immediate.
+        // Wait for a worthwhile batch OR the deadline, whichever comes first.
+        // Waiting only when nothing was ready never accumulated anything: with
+        // packets arriving at ~12900/s there is always one waiting, so the
+        // thread spun writing a single block at a time. The ring holds ~11 s,
+        // so spending 50 ms gathering costs nothing and turns those writes
+        // into ~20 large ones per second.
         pthread_mutex_lock(blocks_resource.lock);
-        while (blocks_resource.nready == 0 && output_active) {
-            pthread_cond_wait(blocks_resource.is_ready, blocks_resource.lock);
+        {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += DRAIN_INTERVAL_MS * 1000L * 1000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            while (output_active && blocks_resource.nready < DRAIN_TARGET_BLOCKS) {
+                if (pthread_cond_timedwait(blocks_resource.is_ready,
+                                           blocks_resource.lock, &deadline) == ETIMEDOUT) {
+                    break;
+                }
+            }
         }
         if (!output_active) {
             pthread_mutex_unlock(blocks_resource.lock);
             break;
         }
-        
-        BlockDescriptor block = ((BlockDescriptor*)blocks_resource.resource)[blocks_resource.read_index];
-        blocks_resource.read_index = (blocks_resource.read_index + 1) % blocks_resource.size;
-        blocks_resource.nready--;
-        blocks_resource.nused--;
-        pthread_mutex_unlock(blocks_resource.lock);
-        
-        // Write the data to file
-        // We write the block as 32-bit floats. (Or 16-bit? Linrad standard is usually 16-bit or 24-bit).
-        // rsp-recorder outputs `short *insamples` which are 16-bit.
-        // Wait, hpsdr provides 24-bit values. If we stored them as floats, we can write them as floats, but if we need compatibility...
-        // Let's write them as 16-bit to be compatible with typical linrad parsers unless they expect floats.
-        int n_channels = diversity ? 4 : 2;
-        int n_samples = block.num_samples * n_channels;
-        unsigned int idx = block.samples_index;
-        unsigned int ring_sz = samples_resource.size;
-        
-        if (idx + n_samples <= ring_sz) {
-            // Contiguous slice: Zero-copy direct write to disk
-            timed_write(&insamples[idx], n_samples * sizeof(int16_t));
-        } else {
-            // Ring buffer wrap-around: Write two contiguous slices
-            unsigned int part1 = ring_sz - idx;
-            unsigned int part2 = n_samples - part1;
-            timed_write(&insamples[idx], part1 * sizeof(int16_t));
-            timed_write(&insamples[0], part2 * sizeof(int16_t));
+        if (blocks_resource.nready == 0) {
+            pthread_mutex_unlock(blocks_resource.lock);
+            continue;
         }
+        
+        // Take every ready block that fits in one coalesced write. They are
+        // contiguous in the ring, so this is one span (two after a wrap).
+        const BlockDescriptor *blocks = (const BlockDescriptor *)blocks_resource.resource;
+        int n_channels = diversity ? 4 : 2;
+        unsigned int start = blocks[blocks_resource.read_index].samples_index;
+        unsigned int total = 0;
+        unsigned int taken = 0;
+        while (taken < blocks_resource.nready) {
+            unsigned int i = (blocks_resource.read_index + taken) % blocks_resource.size;
+            unsigned int vals = blocks[i].num_samples * (unsigned int)n_channels;
+            if (total > 0 && total + vals > COALESCE_MAX_VALUES) {
+                break;
+            }
+            total += vals;
+            taken++;
+        }
+        blocks_resource.read_index = (blocks_resource.read_index + taken) % blocks_resource.size;
+        blocks_resource.nready -= taken;
+        blocks_resource.nused -= taken;
+        pthread_mutex_unlock(blocks_resource.lock);
+
+        unsigned int ring_sz = samples_resource.size;
+        if (start + total <= ring_sz) {
+            timed_write(&insamples[start], total * sizeof(int16_t));
+        } else {
+            unsigned int part1 = ring_sz - start;
+            timed_write(&insamples[start], part1 * sizeof(int16_t));
+            timed_write(&insamples[0], (total - part1) * sizeof(int16_t));
+        }
+        release_page_cache();
 
         // Release the space so the RX thread can tell how far behind we are.
         // Without this, nused only ever grows and overrun is undetectable.
         pthread_mutex_lock(samples_resource.lock);
-        if (samples_resource.nused >= (unsigned int)n_samples) {
-            samples_resource.nused -= n_samples;
+        if (samples_resource.nused >= total) {
+            samples_resource.nused -= total;
         } else {
             samples_resource.nused = 0;
         }

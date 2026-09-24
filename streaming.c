@@ -45,13 +45,23 @@ static inline int16_t pack_q(int32_t v24, int *clipped) {
 // Peak and amplitude distribution of the raw 24-bit samples, so the report is
 // independent of the shift. The distribution is what tells impulse noise apart
 // from steady signal: a single peak cannot.
+static unsigned hist_decim;
+
 static inline void track_peak(int32_t v24, int32_t *peak) {
     int32_t a = v24 < 0 ? -v24 : v24;
     if (a > 8388607) a = 8388607;
     if (a > *peak) *peak = a;
-    stats_amp_hist[a >> STATS_HIST_SHIFT]++;
+    // The peak must see every sample - a maximum cannot be subsampled without
+    // missing impulses. The distribution is statistically identical at 1-in-8
+    // over millions of samples, and this runs 6.1 M times a second.
+    if ((++hist_decim & 7u) == 0u) {
+        stats_amp_hist[a >> STATS_HIST_SHIFT]++;
+    }
 }
 
+// The output thread drains on a timer rather than being signalled per packet:
+// at ~12900 packets/s a signal per block woke it 12900 times a second to write
+// under 1 KB. It is only signalled now to make shutdown immediate.
 static long long overrun_events = 0;
 static int batch_max_seen = 0;
 
@@ -238,7 +248,6 @@ static void process_packet(const uint8_t *buffer, int bytes_read) {
                     blocks_resource.write_index = (blocks_resource.write_index + 1) % blocks_resource.size;
                     blocks_resource.nused++;
                     blocks_resource.nready++;
-                    pthread_cond_signal(blocks_resource.is_ready);
                     pthread_mutex_unlock(blocks_resource.lock);
                 }
                 expected_seq = seq;
