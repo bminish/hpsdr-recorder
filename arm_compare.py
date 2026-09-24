@@ -239,11 +239,11 @@ def main():
         nd = db(f1) - db(f2)
         gap = nd - g
         if abs(gap) < 1.5:
-            note = "both arms antenna-noise-limited"
+            note = "matched: same external noise limit"
         elif gap > 0:
-            note = "ch1 has %.1f dB excess noise (man-made?)" % gap
+            note = "ch1 carries %.1f dB excess noise for its signal" % gap
         else:
-            note = "ch2 is receiver-limited, losing %.1f dB" % (-gap)
+            note = "ch2 carries %.1f dB excess noise (ch1 has that much better SNR)" % (-gap)
         print(f"  {lo/1000:6.0f}-{hi/1000:<7.0f} {len(inb):3d} {g:+8.2f} "
               f"{nd:+8.2f} {gap:+8.2f}   {note}")
 
