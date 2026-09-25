@@ -82,6 +82,12 @@ static int wait_for_stream(double seconds) {
 }
 
 int main(int argc, char *argv[]) {
+    // Line-buffer stdout. Redirected to a file (as cron does), stdout is
+    // block-buffered and only flushes at exit, while stderr is unbuffered -
+    // so a failing run's diagnostics landed in the log ABOVE the lines
+    // describing the run they belonged to, which made them look missing.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (get_config_from_cli(argc, argv) == -1) {
         main_exit(EXIT_FAILURE);
     }
